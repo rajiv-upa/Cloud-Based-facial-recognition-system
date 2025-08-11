@@ -1,0 +1,6 @@
+boto3==1.34.11
+Pillow==10.1.0
+numpy==1.23.5
+opencv-python==4.8.1.78
+pandas==2.1.0
+tkcalendar==1.6.1 

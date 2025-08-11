@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Face Recognition System'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name that will be prefixed to resource names
+    Type: String
+    Default: face-recognition
+
+Resources:
+  # S3 Bucket for storing images
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-images-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Table
+  FaceRecognitionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}-table
+      AttributeDefinitions:
+        - AttributeName: RekognitionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RekognitionId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FaceRecognitionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource: !Sub ${ImageBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt FaceRecognitionTable.Arn
+              - Effect: Allow
+                Action:
+                  - rekognition:IndexFaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${EnvironmentName}-function:*
+
+  # Lambda Function
+  FaceRecognitionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-function
+      Runtime: python3.9
+      Handler: lamdafunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          from decimal import Decimal
+          import json
+          import urllib
+          import os
+
+          print('Loading function')
+
+          dynamodb = boto3.client('dynamodb')
+          s3 = boto3.client('s3')
+          rekognition = boto3.client('rekognition')
+
+          def index_faces(bucket, key):
+              response = rekognition.index_faces(
+                  Image={"S3Object":
+                      {"Bucket": bucket,
+                      "Name": key}},
+                      CollectionId=os.environ['COLLECTION_ID'])
+              return response
+              
+          def update_index(tableName, faceId, fullName):
+              response = dynamodb.put_item(
+                  TableName=tableName,
+                  Item={
+                      'RekognitionId': {'S': faceId},
+                      'FullName': {'S': fullName}
+                      }
+                  ) 
+              return response
+              
+          def lambda_handler(event, context):
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              print("Records: ", event['Records'])
+              key = event['Records'][0]['s3']['object']['key']
+              print("Key: ", key)
+
+              try:
+                  # Get the object metadata first to check for required fields
+                  ret = s3.head_object(Bucket=bucket, Key=key)
+                  if 'fullname' not in ret['Metadata']:
+                      raise ValueError("Image metadata must include 'fullname' field")
+
+                  # Index faces in the image
+                  response = index_faces(bucket, key)
+                  
+                  if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                      if not response['FaceRecords']:
+                          raise ValueError("No faces detected in the image")
+                      
+                      if len(response['FaceRecords']) > 1:
+                          raise ValueError("Multiple faces detected. Please use an image with a single face.")
+
+                      faceId = response['FaceRecords'][0]['Face']['FaceId']
+                      personFullName = ret['Metadata']['fullname']
+
+                      # Use the actual table name from environment
+                      tableName = os.environ['DYNAMODB_TABLE']
+                      update_index(tableName, faceId, personFullName)
+
+                  print(response)
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response)
+                  }
+              except ValueError as ve:
+                  print(f"Validation error: {str(ve)}")
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': str(ve)})
+                  }
+              except Exception as e:
+                  print(f"Error processing object {key} from bucket {bucket}: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          COLLECTION_ID: famouspersons
+          DYNAMODB_TABLE: !Ref FaceRecognitionTable
+
+  # S3 Event Notification
+  S3EventNotification:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FaceRecognitionFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ImageBucket.Arn
+
+  # S3 Bucket Notification
+  S3BucketNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref ImageBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FaceRecognitionFunction.Arn
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref ImageBucket
+  TableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref FaceRecognitionTable
+  FunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref FaceRecognitionFunction 
